@@ -68,6 +68,8 @@ void linenoisePrintKeyCodes(void);
 void linenoiseMaskModeEnable(void);
 void linenoiseMaskModeDisable(void);
 
+int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen, const char *prompt);
+
 #ifdef __cplusplus
 }
 #endif
