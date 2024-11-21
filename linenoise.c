@@ -161,6 +161,7 @@ enum KEY_ACTION{
 	CTRL_F = 6,         /* Ctrl-f */
 	CTRL_H = 8,         /* Ctrl-h */
 	TAB = 9,            /* Tab */
+	RETURN = 10,        /* Enter */
 	CTRL_K = 11,        /* Ctrl+k */
 	CTRL_L = 12,        /* Ctrl+l */
 	ENTER = 13,         /* Enter */
@@ -839,6 +840,7 @@ int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen, const c
 
         switch(c) {
         case ENTER:    /* enter */
+        case RETURN:   /* return */
             history_len--;
             free(history[history_len]);
             if (mlmode) linenoiseEditMoveEnd(&l);
