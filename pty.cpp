@@ -27,6 +27,15 @@ public:
     , m_cmd_listener([](const char * buffer, size_t n){ syslog(LOG_INFO, "CMD '%s'", std::string(buffer, n).c_str()); })
     {}
 
+    ~Session()
+    {
+        m_should_run = false;
+        if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
+        if(m_pty_slave_worker.joinable()) m_pty_slave_worker.join();
+        close(m_master_fd);
+        close(m_slave_fd);
+    }
+
     void setTtyOutputListener(std::function<void(const char *, size_t)> listener)
     {
         m_tty_listener = listener;
@@ -75,7 +84,8 @@ public:
                     else if(fds[0].revents & POLLHUP)
                     {
                         syslog(LOG_ERR, "Linenoise has finished, close down link");
-                        break;
+                        m_should_run = false;
+                        close(m_master_fd);
                     }
                 }
             }
@@ -118,15 +128,6 @@ public:
         );
     }
 
-    ~Session()
-    {
-        m_should_run = false;
-        if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
-        if(m_pty_slave_worker.joinable()) m_pty_slave_worker.join();
-        close(m_master_fd);
-        close(m_slave_fd);
-    }
-
     bool feed(const char *buf, size_t len)
     {
         syslog(LOG_INFO, "Feed '%s'", std::string(buf, len).c_str());
@@ -135,6 +136,11 @@ public:
             return false;
         }
         return true;
+    }
+
+    bool isRunning() const
+    {
+        return m_should_run;
     }
 
 private:
@@ -342,11 +348,21 @@ int main()
     // Communication loop
     while (1)
     {
-        int ret = poll(fds, 1, -1); // Wait indefinitely for events
+        int ret = poll(fds, 1, 1000); // Wait indefinitely for events
         if (ret == -1)
         {
             perror("poll");
             break;
+        }
+
+        if(ret == 0)
+        {
+            if(!session.isRunning())
+            {
+                syslog(LOG_ERR, "Session is closed, exiting...");
+                break;
+            }
+            continue;
         }
 
         // Check if there is data on the UDP socket
@@ -377,7 +393,8 @@ int main()
             // Write data to the master_fd (pseudo-terminal)
             if(!session.feed(buffer, n))
             {
-                perror("write to master_fd");
+                syslog(LOG_ERR, "PTYs are closed, exiting...");
+                break;
             }
         }
     }
