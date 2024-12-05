@@ -1,6 +1,7 @@
 #include <iostream>
 #include <thread>
 #include <stdexcept>
+#include <functional>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -22,61 +23,127 @@ public:
     Session(int master_fd, int slave_fd)
     : m_master_fd(master_fd)
     , m_slave_fd(slave_fd)
-    , m_thread{}
+    , m_tty_listener([](const char * buffer, size_t n){ syslog(LOG_INFO, "TTY '%s'", std::string(buffer, n).c_str()); })
+    , m_cmd_listener([](const char * buffer, size_t n){ syslog(LOG_INFO, "CMD '%s'", std::string(buffer, n).c_str()); })
     {}
+
+    void setTtyOutputListener(std::function<void(const char *, size_t)> listener)
+    {
+        m_tty_listener = listener;
+    }
+
+    void setCmdListener(std::function<void(const char *, size_t)> listener)
+    {
+        m_cmd_listener = listener;
+    }
 
     void run()
     {
-        m_thread = std::thread([this]()
-        {
-            struct linenoiseState ls{};
-            char buf[1024];
-            while(m_should_run)
+        m_pty_master_worker =
+            std::thread([this]()
             {
-                linenoiseEditStart(&ls, m_slave_fd, m_slave_fd, buf, sizeof(buf), "hello> ");
+                // Buffer for incoming UDP data
+                const size_t BUFFER_SIZE = 1024;
+                char buffer[BUFFER_SIZE];
 
-                while(1)
+                // Use poll() to wait for events on master_fd
+                struct pollfd fds[1];
+                fds[0].fd = m_master_fd;
+                fds[0].events = POLLIN | POLLHUP;
+
+                // Communication loop
+                while (m_should_run)
                 {
-                    char *line = linenoiseEditFeed(&ls);
-                    if(line == nullptr)
+                    int ret = poll(fds, 1, -1); // Wait indefinitely for events
+                    if (ret == -1)
                     {
-                        syslog(LOG_INFO, "Good Bye!");
-                        m_should_run = false;
-                        close(m_slave_fd);
+                        syslog(LOG_ERR, "poll");
                         break;
                     }
-                    else if(line == linenoiseEditMore)
+
+                    // Check if there is data on the master_fd from the slave
+                    if (fds[0].revents & POLLIN)
                     {
-                        continue;
+                        ssize_t m = read(m_master_fd, buffer, BUFFER_SIZE - 1);
+                        if (m > 0)
+                        {
+                            buffer[m] = '\0';
+                            syslog(LOG_INFO, "Slave response: '%s'", buffer);
+                            m_tty_listener(buffer, m);
+                        }
                     }
-                    else
+                    else if(fds[0].revents & POLLHUP)
                     {
-                        syslog(LOG_INFO, "CMD:'%s'", line);
-                        linenoiseHistoryAdd(line);
-                        linenoiseFree(line);
-                        write(m_slave_fd, "\r\n", 2);
+                        syslog(LOG_ERR, "Linenoise has finished, close down link");
                         break;
                     }
                 }
             }
-        });
+        );
+
+        m_pty_slave_worker =
+            std::thread([this]()
+            {
+                struct linenoiseState ls{};
+                char buf[1024];
+                while(m_should_run)
+                {
+                    linenoiseEditStart(&ls, m_slave_fd, m_slave_fd, buf, sizeof(buf), "hello> ");
+
+                    while(1)
+                    {
+                        char *line = linenoiseEditFeed(&ls);
+                        if(line == nullptr)
+                        {
+                            syslog(LOG_INFO, "Good Bye!");
+                            m_should_run = false;
+                            close(m_slave_fd);
+                            break;
+                        }
+                        else if(line == linenoiseEditMore)
+                        {
+                            continue;
+                        }
+                        else
+                        {
+                            m_cmd_listener(line, strlen(line));
+                            linenoiseHistoryAdd(line);
+                            linenoiseFree(line);
+                            write(m_slave_fd, "\r\n", 2);
+                            break;
+                        }
+                    }
+                }
+            }
+        );
     }
 
     ~Session()
     {
         m_should_run = false;
-        if(m_thread.joinable())
-            m_thread.join();
+        if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
+        if(m_pty_slave_worker.joinable()) m_pty_slave_worker.join();
         close(m_master_fd);
         close(m_slave_fd);
     }
 
-    int getMasterFd() const { return m_master_fd; }
+    bool feed(const char *buf, size_t len)
+    {
+        syslog(LOG_INFO, "Feed '%s'", std::string(buf, len).c_str());
+        if(::write(m_master_fd, buf, len) == -1)
+        {
+            return false;
+        }
+        return true;
+    }
 
 private:
     int m_master_fd;
     int m_slave_fd;
-    std::thread m_thread;
+    std::function<void(const char *, size_t)> m_tty_listener;
+    std::function<void(const char *, size_t)> m_cmd_listener;
+    std::thread m_pty_master_worker;
+    std::thread m_pty_slave_worker;
     bool m_should_run = true;
 };
 
@@ -214,9 +281,8 @@ int main()
         exit(1);
     }
 
-    syslog(LOG_INFO, "create session");
-    Session session = createSession();
-    session.run();
+
+
 
     // Set up the UDP socket
     const int UDP_PORT = 4545;
@@ -241,25 +307,42 @@ int main()
         close(udp_sock);
         exit(EXIT_FAILURE);
     }
-
     syslog(LOG_INFO, "Listening on UDP port %d", UDP_PORT);
+
+
+
+
+
+
+    syslog(LOG_INFO, "Create session");
+    Session session = createSession();
+
+    session.setCmdListener([](const char * buffer, size_t n)
+    {
+        syslog(LOG_INFO, "CMD '%s'", std::string(buffer, n).c_str());
+    });
+    session.setTtyOutputListener([udp_sock, &client_addr](const char * buffer, size_t n)
+    {
+        syslog(LOG_INFO, "TTY '%s', send to UDP socket", std::string(buffer, n).c_str());
+        sendto(udp_sock, buffer, n, 0, (struct sockaddr *)&client_addr, sizeof(client_addr));
+    });
+
+    syslog(LOG_INFO, "Start session");
+    session.run();
 
     // Buffer for incoming UDP data
     const size_t BUFFER_SIZE = 1024;
     char buffer[BUFFER_SIZE];
-    char slave_buffer[BUFFER_SIZE];
 
     // Use poll() to wait for events on both the UDP socket and master_fd
-    struct pollfd fds[2];
+    struct pollfd fds[1];
     fds[0].fd = udp_sock;
-    fds[0].events = POLLIN | POLLHUP;
-    fds[1].fd = session.getMasterFd();
-    fds[1].events = POLLIN;
+    fds[0].events = POLLIN;
 
     // Communication loop
     while (1)
     {
-        int ret = poll(fds, 2, -1); // Wait indefinitely for events
+        int ret = poll(fds, 1, -1); // Wait indefinitely for events
         if (ret == -1)
         {
             perror("poll");
@@ -278,72 +361,24 @@ int main()
             }
 
             // insert '\r' if only '\n' is received
-            if (n >= 1 && buffer[n-1] == '\n')
+            if (n >= 2 && buffer[n-2] == '\r' && buffer[n-1] == '\n')
+            {
+                // Nothing to do
+            }
+            else if (n >= 1 && buffer[n-1] == '\n')
             {
                 buffer[n-1] = '\r';
                 buffer[n] = '\n';
                 ++n;
             }
             buffer[n] = '\0'; // Null-terminate for safety
-
-            std::string tmp;
-            for (size_t i = 0; i < n; ++i)
-            {
-                if (buffer[i] == '\r')
-                {
-                    tmp += "\\r";
-                }
-                else if (buffer[i] == '\n')
-                {
-                    tmp += "\\n";
-                }
-                else
-                {
-                    tmp += buffer[i];
-                }
-            }
-            syslog(LOG_INFO, "Received UDP data: %s", tmp.c_str());
+            syslog(LOG_INFO, "Received UDP data: %s", buffer);
 
             // Write data to the master_fd (pseudo-terminal)
-            if (write(session.getMasterFd(), buffer, n) == -1)
+            if(!session.feed(buffer, n))
             {
                 perror("write to master_fd");
             }
-        }
-
-        // Check if there is data on the master_fd from the slave
-        if (fds[1].revents & POLLIN)
-        {
-            ssize_t m = read(session.getMasterFd(), slave_buffer, sizeof(slave_buffer) - 1);
-            if (m > 0)
-            {
-                slave_buffer[m] = '\0';
-                std::string tmp;
-                for (size_t i = 0; i < m; ++i)
-                {
-                    if (slave_buffer[i] == '\r')
-                    {
-                        tmp += "\\r";
-                    }
-                    else if (slave_buffer[i] == '\n')
-                    {
-                        tmp += "\\n";
-                    }
-                    else
-                    {
-                        tmp += slave_buffer[i];
-                    }
-                }
-                syslog(LOG_INFO, "Slave response: %s", tmp.c_str());
-
-                // Optional: Respond back to the UDP sender
-                sendto(udp_sock, slave_buffer, m, 0, (struct sockaddr *)&client_addr, client_len);
-            }
-        }
-        else if(fds[1].revents & POLLHUP)
-        {
-            syslog(LOG_ERR, "Linenoise has finished, close down link");
-            break;
         }
     }
 
