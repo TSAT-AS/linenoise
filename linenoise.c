@@ -806,7 +806,7 @@ int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen, const c
     l.plen = strlen(prompt);
     l.oldpos = l.pos = 0;
     l.len = 0;
-    l.cols = getColumns(stdin_fd, stdout_fd);
+    l.cols = 80; // we don't have a column count when started by init
     l.maxrows = 0;
     l.history_index = 0;
 
