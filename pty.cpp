@@ -40,8 +40,10 @@ public:
                     char *line = linenoiseEditFeed(&ls);
                     if(line == nullptr)
                     {
-                        perror("linenoiseEditFeed");
-                        exit(1);
+                        syslog(LOG_INFO, "Good Bye!");
+                        m_should_run = false;
+                        close(m_slave_fd);
+                        break;
                     }
                     else if(line == linenoiseEditMore)
                     {
@@ -250,7 +252,7 @@ int main()
     // Use poll() to wait for events on both the UDP socket and master_fd
     struct pollfd fds[2];
     fds[0].fd = udp_sock;
-    fds[0].events = POLLIN;
+    fds[0].events = POLLIN | POLLHUP;
     fds[1].fd = session.getMasterFd();
     fds[1].events = POLLIN;
 
@@ -337,10 +339,11 @@ int main()
                 // Optional: Respond back to the UDP sender
                 sendto(udp_sock, slave_buffer, m, 0, (struct sockaddr *)&client_addr, client_len);
             }
-            else if (m == -1)
-            {
-                perror("read from master_fd");
-            }
+        }
+        else if(fds[1].revents & POLLHUP)
+        {
+            syslog(LOG_ERR, "Linenoise has finished, close down link");
+            break;
         }
     }
 
