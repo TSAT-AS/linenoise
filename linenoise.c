@@ -220,7 +220,7 @@ static int isUnsupportedTerm(void) {
 static int enableRawMode(int fd) {
     struct termios raw;
 
-    if (!isatty(STDIN_FILENO)) goto fatal;
+    if (!isatty(fd)) goto fatal;
     if (!atexit_registered) {
         atexit(linenoiseAtExit);
         atexit_registered = 1;
@@ -288,7 +288,7 @@ static int getCursorPosition(int ifd, int ofd) {
 static int getColumns(int ifd, int ofd) {
     struct winsize ws;
 
-    if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+    if (ioctl(ofd, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
         /* ioctl() failed. Try to query the terminal itself. */
         int start, cols;
 
@@ -1093,7 +1093,7 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
 void linenoiseEditStop(struct linenoiseState *l) {
     if (!isatty(l->ifd)) return;
     disableRawMode(l->ifd);
-    printf("\n");
+    write(l->ofd, "\n", 1);
 }
 
 /* This just implements a blocking loop for the multiplexed API.
