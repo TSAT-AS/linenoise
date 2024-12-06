@@ -1,37 +1,36 @@
-#include <iostream>
-#include <thread>
-#include <stdexcept>
 #include <functional>
-#include <unistd.h>
+#include <stdexcept>
+#include <thread>
+
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <syslog.h>
-#include <fcntl.h>
-#include <sys/resource.h>
-#include "linenoise.h"
-#include <signal.h>
-#include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <syslog.h>
+#include <unistd.h>
+
+#include "linenoise.h"
+
 class Session
 {
 public:
     Session(int master_fd, int slave_fd)
     : m_master_fd(master_fd)
     , m_slave_fd(slave_fd)
-    , m_tty_listener([](const char * buffer, size_t n){ syslog(LOG_INFO, "TTY '%s'", std::string(buffer, n).c_str()); })
-    , m_cmd_listener([](const char * buffer, size_t n){ syslog(LOG_INFO, "CMD '%s'", std::string(buffer, n).c_str()); })
+    , m_tty_listener([](const char *, size_t){ syslog(LOG_INFO, "TTY LISTENER NOT SET"); })
+    , m_cmd_listener([](std::string){ syslog(LOG_INFO, "CMD LISTENER NOT SET"); })
     {}
 
     ~Session()
     {
-        m_should_run = false;
-        if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
-        if(m_pty_slave_worker.joinable()) m_pty_slave_worker.join();
+        stop();
         close(m_master_fd);
         close(m_slave_fd);
     }
@@ -41,12 +40,12 @@ public:
         m_tty_listener = listener;
     }
 
-    void setCmdListener(std::function<void(const char *, size_t)> listener)
+    void setCmdListener(std::function<void(std::string)> listener)
     {
         m_cmd_listener = listener;
     }
 
-    void run()
+    void start()
     {
         m_pty_master_worker =
             std::thread([this]()
@@ -63,11 +62,15 @@ public:
                 // Communication loop
                 while (m_should_run)
                 {
-                    int ret = poll(fds, 1, -1); // Wait indefinitely for events
+                    int ret = poll(fds, 1, 1000); // Wait indefinitely for events
                     if (ret == -1)
                     {
                         syslog(LOG_ERR, "poll");
                         break;
+                    }
+                    if(ret == 0)
+                    {
+                        continue;
                     }
 
                     // Check if there is data on the master_fd from the slave
@@ -88,6 +91,8 @@ public:
                         close(m_master_fd);
                     }
                 }
+
+                syslog(LOG_INFO, "Master thread exiting...");
             }
         );
 
@@ -105,27 +110,34 @@ public:
                         char *line = linenoiseEditFeed(&ls);
                         if(line == nullptr)
                         {
-                            syslog(LOG_INFO, "Good Bye!");
-                            m_should_run = false;
-                            close(m_slave_fd);
+                            // Ctrl-C or Ctrl-D
                             break;
                         }
                         else if(line == linenoiseEditMore)
                         {
+                            // Waiting for more input
                             continue;
                         }
                         else
                         {
-                            m_cmd_listener(line, strlen(line));
+                            m_cmd_listener(line);
                             linenoiseHistoryAdd(line);
                             linenoiseFree(line);
-                            write(m_slave_fd, "\r\n", 2);
                             break;
                         }
                     }
+                    linenoiseEditStop(&ls);
                 }
+                syslog(LOG_INFO, "Slave thread exiting...");
             }
         );
+    }
+
+    void stop()
+    {
+        m_should_run = false;
+        if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
+        if(m_pty_slave_worker.joinable()) m_pty_slave_worker.join();
     }
 
     bool feed(const char *buf, size_t len)
@@ -147,7 +159,7 @@ private:
     int m_master_fd;
     int m_slave_fd;
     std::function<void(const char *, size_t)> m_tty_listener;
-    std::function<void(const char *, size_t)> m_cmd_listener;
+    std::function<void(std::string)> m_cmd_listener;
     std::thread m_pty_master_worker;
     std::thread m_pty_slave_worker;
     bool m_should_run = true;
@@ -158,20 +170,20 @@ Session createSession()
     // Open the master pseudo-terminal
     int master_fd = posix_openpt(O_RDWR | O_NOCTTY);
     if (master_fd == -1) {
-        perror("posix_openpt");
+        syslog(LOG_ERR, "ERROR: posix_openpt");
         exit(1);
     }
 
     // Grant access to the slave
     if (grantpt(master_fd) == -1) {
-        perror("grantpt");
+        syslog(LOG_ERR, "ERROR: grantpt");
         close(master_fd);
         exit(1);
     }
 
     // Unlock the slave
     if (unlockpt(master_fd) == -1) {
-        perror("unlockpt");
+        syslog(LOG_ERR, "ERROR: unlockpt");
         close(master_fd);
         exit(1);
     }
@@ -179,14 +191,14 @@ Session createSession()
     // Get the name of the slave device
     char slave_name[100];
     if (ptsname_r(master_fd, slave_name, sizeof(slave_name)) != 0) {
-        perror("ptsname_r");
+        syslog(LOG_ERR, "ERROR: ptsname_r");
         close(master_fd);
         exit(1);
     }
 
     int slave_fd = open(slave_name, O_RDWR);
     if (slave_fd == -1) {
-        perror("open");
+        syslog(LOG_ERR, "ERROR: open");
         exit(1);
     }
 
@@ -195,7 +207,7 @@ Session createSession()
     int res = ioctl(slave_fd, TIOCSWINSZ, &ws);
     if(res == -1)
     {
-        perror("ioctl");
+        syslog(LOG_ERR, "ERROR: ioctl");
         exit(1);
     }
 
@@ -288,14 +300,27 @@ int main()
     }
 
 
+    // Set up the TCP socket
+    const int TCP_PORT = 4545;
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock == -1) {
+        syslog(LOG_ERR, "ERROR: socket");
+        exit(EXIT_FAILURE);
+    }
 
+    // Enable SO_REUSEADDR
+    int opt = 1;
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+        syslog(LOG_ERR, "setsockopt(SO_REUSEADDR)");
+        close(server_sock);
+        exit(EXIT_FAILURE);
+    }
 
-    // Set up the UDP socket
-    const int UDP_PORT = 4545;
-    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_sock == -1)
-    {
-        perror("socket");
+    // Set SO_LINGER for a short period
+    struct linger linger_opt = {1, 5}; // Enable linger, wait for 5 seconds
+    if (setsockopt(server_sock, SOL_SOCKET, SO_LINGER, &linger_opt, sizeof(linger_opt)) == -1) {
+        syslog(LOG_ERR, "setsockopt(SO_LINGER)");
+        close(server_sock);
         exit(EXIT_FAILURE);
     }
 
@@ -305,15 +330,54 @@ int main()
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(UDP_PORT);
+    server_addr.sin_port = htons(TCP_PORT);
 
-    if (bind(udp_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1)
-    {
-        perror("bind");
-        close(udp_sock);
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+        syslog(LOG_ERR, "ERROR: bind");
+        close(server_sock);
         exit(EXIT_FAILURE);
     }
-    syslog(LOG_INFO, "Listening on UDP port %d", UDP_PORT);
+
+    if (listen(server_sock, 1) == -1) {
+        syslog(LOG_ERR, "ERROR: listen");
+        close(server_sock);
+        exit(EXIT_FAILURE);
+    }
+
+    syslog(LOG_INFO, "Listening on TCP port %d", TCP_PORT);
+
+    // Accept a single client connection
+    int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
+    if (client_sock == -1) {
+        syslog(LOG_ERR, "ERROR: accept");
+        close(server_sock);
+        exit(EXIT_FAILURE);
+    }
+
+    // Set up the UDP socket
+    // const int UDP_PORT = 4545;
+    // int client_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    // if (client_sock == -1)
+    // {
+    //     syslog(LOG_ERR, "ERROR: socket");
+    //     exit(EXIT_FAILURE);
+    // }
+
+    // struct sockaddr_in server_addr, client_addr;
+    // socklen_t client_len = sizeof(client_addr);
+    // memset(&server_addr, 0, sizeof(server_addr));
+
+    // server_addr.sin_family = AF_INET;
+    // server_addr.sin_addr.s_addr = INADDR_ANY;
+    // server_addr.sin_port = htons(UDP_PORT);
+
+    // if (bind(client_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1)
+    // {
+    //     syslog(LOG_ERR, "ERROR: bind");
+    //     close(client_sock);
+    //     exit(EXIT_FAILURE);
+    // }
+    // syslog(LOG_INFO, "Listening on UDP port %d", UDP_PORT);
 
 
 
@@ -323,18 +387,18 @@ int main()
     syslog(LOG_INFO, "Create session");
     Session session = createSession();
 
-    session.setCmdListener([](const char * buffer, size_t n)
+    session.setCmdListener([](std::string cmd)
     {
-        syslog(LOG_INFO, "CMD '%s'", std::string(buffer, n).c_str());
+        syslog(LOG_INFO, "CMD '%s'", cmd.c_str());
     });
-    session.setTtyOutputListener([udp_sock, &client_addr](const char * buffer, size_t n)
+    session.setTtyOutputListener([client_sock, &client_addr](const char * buffer, size_t n)
     {
-        syslog(LOG_INFO, "TTY '%s', send to UDP socket", std::string(buffer, n).c_str());
-        sendto(udp_sock, buffer, n, 0, (struct sockaddr *)&client_addr, sizeof(client_addr));
+        syslog(LOG_INFO, "TTY '%s', send to client socket", std::string(buffer, n).c_str());
+        sendto(client_sock, buffer, n, 0, (struct sockaddr *)&client_addr, sizeof(client_addr));
     });
 
     syslog(LOG_INFO, "Start session");
-    session.run();
+    session.start();
 
     // Buffer for incoming UDP data
     const size_t BUFFER_SIZE = 1024;
@@ -342,7 +406,7 @@ int main()
 
     // Use poll() to wait for events on both the UDP socket and master_fd
     struct pollfd fds[1];
-    fds[0].fd = udp_sock;
+    fds[0].fd = client_sock;
     fds[0].events = POLLIN;
 
     // Communication loop
@@ -351,7 +415,7 @@ int main()
         int ret = poll(fds, 1, 1000); // Wait indefinitely for events
         if (ret == -1)
         {
-            perror("poll");
+            syslog(LOG_ERR, "ERROR: poll");
             break;
         }
 
@@ -368,11 +432,17 @@ int main()
         // Check if there is data on the UDP socket
         if (fds[0].revents & POLLIN)
         {
-            ssize_t n = recvfrom(udp_sock, buffer, BUFFER_SIZE - 1, 0,
-                                    (struct sockaddr *)&client_addr, &client_len);
+            // ssize_t n = recvfrom(client_sock, buffer, BUFFER_SIZE - 1, 0,
+            //                         (struct sockaddr *)&client_addr, &client_len);
+            ssize_t n = read(client_sock, buffer, BUFFER_SIZE - 1);
+            if (n == 0) {
+                syslog(LOG_INFO, "Client disconnected");
+                session.stop();
+                break;
+            }
             if (n == -1)
             {
-                perror("recvfrom");
+                syslog(LOG_ERR, "Client read error");
                 continue;
             }
 
@@ -388,7 +458,7 @@ int main()
                 ++n;
             }
             buffer[n] = '\0'; // Null-terminate for safety
-            syslog(LOG_INFO, "Received UDP data: %s", buffer);
+            syslog(LOG_INFO, "Received client socket data: %s", buffer);
 
             // Write data to the master_fd (pseudo-terminal)
             if(!session.feed(buffer, n))
@@ -400,7 +470,7 @@ int main()
     }
 
     // Close sockets and file descriptors
-    close(udp_sock);
+    close(client_sock);
 
     syslog(LOG_INFO, "Exiting...");
     return 0;
