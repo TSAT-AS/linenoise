@@ -31,8 +31,6 @@ public:
     ~Session()
     {
         stop();
-        close(m_master_fd);
-        close(m_slave_fd);
     }
 
     void setTtyOutputListener(std::function<void(const char *, size_t)> listener)
@@ -47,17 +45,21 @@ public:
 
     void start()
     {
+        syslog(LOG_INFO, "Starting session");
+
+        m_should_run = true;
+
         m_pty_master_worker =
             std::thread([this]()
             {
-                // Buffer for incoming UDP data
+                // Buffer for master and slave data
                 const size_t BUFFER_SIZE = 1024;
                 char buffer[BUFFER_SIZE];
 
                 // Use poll() to wait for events on master_fd
                 struct pollfd fds[1];
                 fds[0].fd = m_master_fd;
-                fds[0].events = POLLIN | POLLHUP;
+                fds[0].events = POLLIN;
 
                 // Communication loop
                 while (m_should_run)
@@ -70,6 +72,7 @@ public:
                     }
                     if(ret == 0)
                     {
+                        // timeout
                         continue;
                     }
 
@@ -103,7 +106,13 @@ public:
                 char buf[1024];
                 while(m_should_run)
                 {
-                    linenoiseEditStart(&ls, m_slave_fd, m_slave_fd, buf, sizeof(buf), "hello> ");
+                    int res = linenoiseEditStart(&ls, m_slave_fd, m_slave_fd, buf, sizeof(buf), "hello> ");
+                    if(res == -1)
+                    {
+                        syslog(LOG_ERR, "linenoiseEditStart");
+                        m_should_run = false;
+                        continue;
+                    }
 
                     while(1)
                     {
@@ -111,6 +120,7 @@ public:
                         if(line == nullptr)
                         {
                             // Ctrl-C or Ctrl-D
+                            // or pty has been closed from the master
                             break;
                         }
                         else if(line == linenoiseEditMore)
@@ -135,9 +145,12 @@ public:
 
     void stop()
     {
+        syslog(LOG_INFO, "Stopping session");
         m_should_run = false;
         if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
+        close(m_master_fd);
         if(m_pty_slave_worker.joinable()) m_pty_slave_worker.join();
+        close(m_slave_fd);
     }
 
     bool feed(const char *buf, size_t len)
@@ -162,7 +175,7 @@ private:
     std::function<void(std::string)> m_cmd_listener;
     std::thread m_pty_master_worker;
     std::thread m_pty_slave_worker;
-    bool m_should_run = true;
+    bool m_should_run = false;
 };
 
 Session createSession()
@@ -396,8 +409,6 @@ int main()
         syslog(LOG_INFO, "TTY '%s', send to client socket", std::string(buffer, n).c_str());
         sendto(client_sock, buffer, n, 0, (struct sockaddr *)&client_addr, sizeof(client_addr));
     });
-
-    syslog(LOG_INFO, "Start session");
     session.start();
 
     // Buffer for incoming UDP data
@@ -463,9 +474,14 @@ int main()
             // Write data to the master_fd (pseudo-terminal)
             if(!session.feed(buffer, n))
             {
-                syslog(LOG_ERR, "PTYs are closed, exiting...");
-                break;
+                syslog(LOG_ERR, "PTY won't accept input");
             }
+        }
+        else if(fds[0].revents & POLLHUP)
+        {
+            syslog(LOG_ERR, "Client disconnected");
+            session.stop();
+            break;
         }
     }
 
