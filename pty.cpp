@@ -18,11 +18,20 @@
 
 #include "linenoise.h"
 
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/posix/stream_descriptor.hpp>
+#include <boost/asio/streambuf.hpp>
+#include <boost/asio/write.hpp>
+#include <boost/asio/read.hpp>
+
 class Session
 {
 public:
-    Session(int master_fd, int slave_fd)
-    : m_master_fd(master_fd)
+    Session(boost::asio::io_context& io_context, int master_fd, int slave_fd)
+    : master_side_(io_context, master_fd)
+    , input_buffer_(1024)
+    , output_buffer_(1024)
+    , m_master_fd(master_fd)
     , m_slave_fd(slave_fd)
     , m_tty_listener([](const char *, size_t){ syslog(LOG_INFO, "TTY LISTENER NOT SET"); })
     , m_cmd_listener([](std::string){ syslog(LOG_INFO, "CMD LISTENER NOT SET"); })
@@ -43,61 +52,36 @@ public:
         m_cmd_listener = listener;
     }
 
+    void do_read()
+    {
+        syslog(LOG_ERR, "do_read()");
+        boost::asio::async_read(master_side_, input_buffer_, boost::asio::transfer_at_least(1),
+        [this](boost::system::error_code ec, std::size_t length)
+        {
+            if (!ec)
+            {
+                syslog(LOG_INFO, "Master side read %zu bytes", length);
+                const char *data = boost::asio::buffer_cast<const char *>(input_buffer_.data());
+                m_tty_listener(data, length);
+                input_buffer_.consume(length);
+                do_read();
+            }
+            else
+            {
+                syslog(LOG_ERR, "ERROR: master side read error");
+                // close();
+                m_should_run = false;
+            }
+        });
+    }
+
     void start()
     {
         syslog(LOG_INFO, "Starting session");
 
+        do_read();
+
         m_should_run = true;
-
-        m_pty_master_worker =
-            std::thread([this]()
-            {
-                // Buffer for master and slave data
-                const size_t BUFFER_SIZE = 1024;
-                char buffer[BUFFER_SIZE];
-
-                // Use poll() to wait for events on master_fd
-                struct pollfd fds[1];
-                fds[0].fd = m_master_fd;
-                fds[0].events = POLLIN;
-
-                // Communication loop
-                while (m_should_run)
-                {
-                    int ret = poll(fds, 1, 1000); // Wait indefinitely for events
-                    if (ret == -1)
-                    {
-                        syslog(LOG_ERR, "poll");
-                        break;
-                    }
-                    if(ret == 0)
-                    {
-                        // timeout
-                        continue;
-                    }
-
-                    // Check if there is data on the master_fd from the slave
-                    if (fds[0].revents & POLLIN)
-                    {
-                        ssize_t m = read(m_master_fd, buffer, BUFFER_SIZE - 1);
-                        if (m > 0)
-                        {
-                            buffer[m] = '\0';
-                            syslog(LOG_INFO, "Slave response: '%s'", buffer);
-                            m_tty_listener(buffer, m);
-                        }
-                    }
-                    else if(fds[0].revents & POLLHUP)
-                    {
-                        syslog(LOG_ERR, "Linenoise has finished, close down link");
-                        m_should_run = false;
-                        close(m_master_fd);
-                    }
-                }
-
-                syslog(LOG_INFO, "Master thread exiting...");
-            }
-        );
 
         m_pty_slave_worker =
             std::thread([this]()
@@ -106,16 +90,19 @@ public:
                 char buf[1024];
                 while(m_should_run)
                 {
+
                     int res = linenoiseEditStart(&ls, m_slave_fd, m_slave_fd, buf, sizeof(buf), "hello> ");
                     if(res == -1)
                     {
-                        syslog(LOG_ERR, "linenoiseEditStart");
+                        syslog(LOG_ERR, "linenoiseEditStart error");
                         m_should_run = false;
                         continue;
                     }
 
                     while(1)
                     {
+                        syslog(LOG_ERR, "linenoiseEditStart success");
+
                         char *line = linenoiseEditFeed(&ls);
                         if(line == nullptr)
                         {
@@ -147,20 +134,39 @@ public:
     {
         syslog(LOG_INFO, "Stopping session");
         m_should_run = false;
-        if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
+        // if(m_pty_master_worker.joinable()) m_pty_master_worker.join();
         close(m_master_fd);
         if(m_pty_slave_worker.joinable()) m_pty_slave_worker.join();
         close(m_slave_fd);
     }
 
-    bool feed(const char *buf, size_t len)
+    void feed(const char *buf, size_t len)
     {
         syslog(LOG_INFO, "Feed '%s'", std::string(buf, len).c_str());
-        if(::write(m_master_fd, buf, len) == -1)
+        // if(::write(m_master_fd, buf, len) == -1)
+        // {
+        //     return false;
+        // }
+        // return true;
+
+        // use ostream to populate output buffer
+        std::ostream os(&output_buffer_);
+        os.write(buf, len);
+
+        boost::asio::async_write(master_side_, output_buffer_,
+        [this](boost::system::error_code ec, std::size_t length)
         {
-            return false;
-        }
-        return true;
+          if (ec)
+          {
+            syslog(LOG_ERR, "Master side write error");
+            // close();
+            m_should_run = false;
+          }
+          else
+          {
+            syslog(LOG_INFO, "Master side write %zu bytes", length);
+          }
+        });
     }
 
     bool isRunning() const
@@ -169,6 +175,10 @@ public:
     }
 
 private:
+    boost::asio::posix::stream_descriptor master_side_;
+    boost::asio::streambuf input_buffer_;
+    boost::asio::streambuf output_buffer_;
+
     int m_master_fd;
     int m_slave_fd;
     std::function<void(const char *, size_t)> m_tty_listener;
@@ -178,7 +188,7 @@ private:
     bool m_should_run = false;
 };
 
-Session createSession()
+Session createSession(boost::asio::io_context& io_context)
 {
     // Open the master pseudo-terminal
     int master_fd = posix_openpt(O_RDWR | O_NOCTTY);
@@ -224,7 +234,7 @@ Session createSession()
         exit(1);
     }
 
-    return Session(master_fd, slave_fd);
+    return Session(io_context, master_fd, slave_fd);
 }
 
 int main()
@@ -392,14 +402,10 @@ int main()
     // }
     // syslog(LOG_INFO, "Listening on UDP port %d", UDP_PORT);
 
-
-
-
-
+    boost::asio::io_context io_context;
 
     syslog(LOG_INFO, "Create session");
-    Session session = createSession();
-
+    Session session = createSession(io_context);
     session.setCmdListener([](std::string cmd)
     {
         syslog(LOG_INFO, "CMD '%s'", cmd.c_str());
@@ -420,10 +426,11 @@ int main()
     fds[0].fd = client_sock;
     fds[0].events = POLLIN;
 
+    io_context.poll();
     // Communication loop
     while (1)
     {
-        int ret = poll(fds, 1, 1000); // Wait indefinitely for events
+        int ret = poll(fds, 1, 100); // Wait indefinitely for events
         if (ret == -1)
         {
             syslog(LOG_ERR, "ERROR: poll");
@@ -432,6 +439,7 @@ int main()
 
         if(ret == 0)
         {
+            io_context.poll();
             if(!session.isRunning())
             {
                 syslog(LOG_ERR, "Session is closed, exiting...");
@@ -472,10 +480,7 @@ int main()
             syslog(LOG_INFO, "Received client socket data: %s", buffer);
 
             // Write data to the master_fd (pseudo-terminal)
-            if(!session.feed(buffer, n))
-            {
-                syslog(LOG_ERR, "PTY won't accept input");
-            }
+            session.feed(buffer, n);
         }
         else if(fds[0].revents & POLLHUP)
         {
